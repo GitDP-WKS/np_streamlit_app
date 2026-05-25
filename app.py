@@ -21,6 +21,9 @@ REFERENCE_COLUMN_CANDIDATES = [
     "Наименование населенного пункта",
 ]
 
+DELETE_EXCEL_COLUMN_INDEXES = [41]  # AP в Excel, нумерация pandas с нуля
+HIDE_EXCEL_RANGES = ["A:B", "E:U", "Y:AM"]
+
 
 def compact_text(value: object) -> str:
     if pd.isna(value):
@@ -206,17 +209,30 @@ def build_summary(
     )
 
 
+def prepare_export_dataframe(parsed_df: pd.DataFrame) -> pd.DataFrame:
+    export_df = parsed_df.copy()
+    columns_to_drop = [
+        export_df.columns[index]
+        for index in DELETE_EXCEL_COLUMN_INDEXES
+        if index < len(export_df.columns)
+    ]
+    if columns_to_drop:
+        export_df = export_df.drop(columns=columns_to_drop)
+    return export_df
+
+
 def make_excel(parsed_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
+    export_df = prepare_export_dataframe(parsed_df)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        parsed_df.to_excel(writer, index=False, sheet_name="Исправленный файл")
+        export_df.to_excel(writer, index=False, sheet_name="Исправленный файл")
         summary_df.to_excel(writer, index=False, sheet_name="Сводка")
 
         workbook = writer.book
         header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
 
         for sheet_name, sheet_df in {
-            "Исправленный файл": parsed_df,
+            "Исправленный файл": export_df,
             "Сводка": summary_df,
         }.items():
             worksheet = writer.sheets[sheet_name]
@@ -225,6 +241,10 @@ def make_excel(parsed_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
                 width = min(max(len(str(value)) + 4, 14), 42)
                 worksheet.set_column(col_num, col_num, width)
             worksheet.freeze_panes(1, 0)
+
+        result_worksheet = writer.sheets["Исправленный файл"]
+        for column_range in HIDE_EXCEL_RANGES:
+            result_worksheet.set_column(column_range, None, None, {"hidden": True})
 
     return output.getvalue()
 
