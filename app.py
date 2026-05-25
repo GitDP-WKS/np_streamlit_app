@@ -17,8 +17,17 @@ PRIMARY_COLUMNS = {
     "status": ["Статус населенного пункта", "Статус НП", "Тип населенного пункта"],
 }
 
+FIELD_LABELS = {
+    "filial_new": "Филиал новый",
+    "res_new": "РЭС новый",
+    "district": "Район",
+    "np": "Населенный пункт для парсинга",
+    "status": "Статус населенного пункта",
+}
+
 OLD_COLUMNS = ["Филиал", "РЭС"]
 FUZZY_LIMIT = 92
+DEFAULT_PARSE_COLUMN = "НП очищенный"
 
 
 def normalize_column_name(value: object) -> str:
@@ -92,24 +101,127 @@ def read_excel_sheets(uploaded_file) -> dict[str, pd.DataFrame]:
     return pd.read_excel(uploaded_file, sheet_name=None)
 
 
-def build_column_map(df: pd.DataFrame) -> dict[str, str | None]:
+def build_auto_column_map(df: pd.DataFrame) -> dict[str, str | None]:
     return {key: find_column(df.columns, variants) for key, variants in PRIMARY_COLUMNS.items()}
+
+
+def column_selectbox(label: str, columns: list[str], suggested: str | None, key: str, required: bool = True) -> str | None:
+    options = columns if required else ["Не использовать"] + columns
+    if suggested in options:
+        index = options.index(suggested)
+    else:
+        index = 0
+
+    value = st.selectbox(label, options, index=index, key=key)
+    if value == "Не использовать":
+        return None
+    return value
+
+
+def choose_columns(df: pd.DataFrame) -> dict[str, str | None]:
+    columns = list(df.columns)
+    auto_map = build_auto_column_map(df)
+
+    st.subheader("Настройка столбцов")
+    st.caption("Приложение предложит найденные столбцы автоматически, но их можно изменить вручную.")
+
+    with st.expander("Автоматически найденные столбцы", expanded=False):
+        st.dataframe(
+            pd.DataFrame(
+                [{"Поле": FIELD_LABELS[key], "Найдено": value or "не найдено"} for key, value in auto_map.items()]
+            ),
+            use_container_width=True,
+        )
+
+    left, right = st.columns(2)
+    with left:
+        filial_new = column_selectbox(
+            "Столбец с новым филиалом",
+            columns,
+            auto_map.get("filial_new"),
+            "select_filial_new",
+        )
+        district = column_selectbox(
+            "Столбец с районом",
+            columns,
+            auto_map.get("district"),
+            "select_district",
+        )
+    with right:
+        res_new = column_selectbox(
+            "Столбец с новым РЭС",
+            columns,
+            auto_map.get("res_new"),
+            "select_res_new",
+        )
+        np_col = column_selectbox(
+            "Столбец, который нужно парсить",
+            columns,
+            auto_map.get("np"),
+            "select_np_col",
+        )
+
+    status_col = column_selectbox(
+        "Столбец со статусом НП, если есть. В дублях не используется",
+        columns,
+        auto_map.get("status"),
+        "select_status_col",
+        required=False,
+    )
+
+    return {
+        "filial_new": filial_new,
+        "res_new": res_new,
+        "district": district,
+        "np": np_col,
+        "status": status_col,
+    }
+
+
+def choose_parse_output(df: pd.DataFrame) -> tuple[str, bool]:
+    st.subheader("Куда записать результат парсинга")
+
+    mode = st.radio(
+        "Выберите способ записи результата",
+        ["Создать новую колонку", "Записать в существующую колонку"],
+        horizontal=True,
+    )
+
+    if mode == "Создать новую колонку":
+        parse_column = st.text_input("Название новой колонки", value=DEFAULT_PARSE_COLUMN)
+        overwrite_existing = False
+    else:
+        parse_column = st.selectbox("Колонка для записи результата", list(df.columns))
+        overwrite_existing = True
+
+    parse_column = compact_text(parse_column)
+    if not parse_column:
+        st.error("Укажите название колонки для результата парсинга.")
+        st.stop()
+
+    if parse_column in df.columns and not overwrite_existing:
+        st.warning(
+            f"Колонка '{parse_column}' уже есть в файле. Результат будет записан в нее, чтобы не создавать дубль."
+        )
+        overwrite_existing = True
+
+    return parse_column, overwrite_existing
 
 
 def validate_required_columns(col_map: dict[str, str | None]) -> list[str]:
     missing = []
     for key in ["filial_new", "res_new", "district", "np"]:
         if not col_map.get(key):
-            missing.append(PRIMARY_COLUMNS[key][0])
+            missing.append(FIELD_LABELS[key])
     return missing
 
 
-def prepare_dataframe(df: pd.DataFrame, col_map: dict[str, str | None]) -> pd.DataFrame:
+def prepare_dataframe(df: pd.DataFrame, col_map: dict[str, str | None], parse_column: str) -> pd.DataFrame:
     result = df.copy()
 
     np_col = col_map["np"]
-    result["НП очищенный"] = result[np_col].apply(clean_np)
-    result["_np_key"] = result[np_col].apply(normalize_np_key)
+    result[parse_column] = result[np_col].apply(clean_np)
+    result["_np_key"] = result[parse_column].apply(normalize_np_key)
 
     for key, output_col in [
         ("filial_new", "_filial_key"),
@@ -135,13 +247,13 @@ def prepare_dataframe(df: pd.DataFrame, col_map: dict[str, str | None]) -> pd.Da
     return result
 
 
-def find_suspicious_pairs(df: pd.DataFrame, col_map: dict[str, str | None]) -> pd.DataFrame:
+def find_suspicious_pairs(df: pd.DataFrame, col_map: dict[str, str | None], parse_column: str) -> pd.DataFrame:
     rows = []
     group_cols = ["_filial_key", "_res_key", "_district_key"]
 
     for _, group in df.groupby(group_cols, dropna=False):
         unique_names = (
-            group[["_np_key", "НП очищенный"]]
+            group[["_np_key", parse_column]]
             .dropna()
             .drop_duplicates()
             .query("_np_key != ''")
@@ -157,8 +269,8 @@ def find_suspicious_pairs(df: pd.DataFrame, col_map: dict[str, str | None]) -> p
                             "Филиал новый": group[col_map["filial_new"]].iloc[0],
                             "РЭС новый": group[col_map["res_new"]].iloc[0],
                             "Район": group[col_map["district"]].iloc[0],
-                            "Вариант 1": left["НП очищенный"],
-                            "Вариант 2": right["НП очищенный"],
+                            "Вариант 1": left[parse_column],
+                            "Вариант 2": right[parse_column],
                             "Похожесть": round(score, 1),
                             "Комментарий": "возможная разница в написании",
                         }
@@ -167,7 +279,12 @@ def find_suspicious_pairs(df: pd.DataFrame, col_map: dict[str, str | None]) -> p
     return pd.DataFrame(rows)
 
 
-def build_summary(df: pd.DataFrame, suspicious_df: pd.DataFrame, col_map: dict[str, str | None]) -> pd.DataFrame:
+def build_summary(
+    df: pd.DataFrame,
+    suspicious_df: pd.DataFrame,
+    col_map: dict[str, str | None],
+    parse_column: str,
+) -> pd.DataFrame:
     rows_total = len(df)
     duplicate_rows = int((df["Количество дублей"] > 1).sum())
     duplicate_groups = int(df.loc[df["Количество дублей"] > 1, "Группа дубля"].nunique())
@@ -183,7 +300,9 @@ def build_summary(df: pd.DataFrame, suspicious_df: pd.DataFrame, col_map: dict[s
             {"Показатель": "Колонка филиала", "Значение": col_map["filial_new"]},
             {"Показатель": "Колонка РЭС", "Значение": col_map["res_new"]},
             {"Показатель": "Колонка района", "Значение": col_map["district"]},
-            {"Показатель": "Колонка НП", "Значение": col_map["np"]},
+            {"Показатель": "Колонка для парсинга", "Значение": col_map["np"]},
+            {"Показатель": "Колонка результата парсинга", "Значение": parse_column},
+            {"Показатель": "Колонка статуса НП", "Значение": col_map.get("status") or "не используется"},
         ]
     )
 
@@ -257,23 +376,30 @@ if source_df.empty:
     st.warning("Выбранный лист пустой.")
     st.stop()
 
-col_map = build_column_map(source_df)
+st.subheader("Предпросмотр файла")
+st.dataframe(source_df.head(30), use_container_width=True)
+
+col_map = choose_columns(source_df)
 missing_columns = validate_required_columns(col_map)
 
-with st.expander("Найденные колонки", expanded=False):
-    st.write(pd.DataFrame([{"Поле": key, "Найденная колонка": value} for key, value in col_map.items()]))
-
 if missing_columns:
-    st.error("Не найдены обязательные колонки: " + ", ".join(missing_columns))
-    st.dataframe(source_df.head(30), use_container_width=True)
+    st.error("Не выбраны обязательные столбцы: " + ", ".join(missing_columns))
     st.stop()
 
-clean_df = prepare_dataframe(source_df, col_map)
+parse_column, overwrite_existing = choose_parse_output(source_df)
+
+run_analysis = st.button("Запустить анализ", type="primary")
+
+if not run_analysis:
+    st.info("Выберите нужные столбцы, укажите колонку результата парсинга и нажмите кнопку анализа.")
+    st.stop()
+
+clean_df = prepare_dataframe(source_df, col_map, parse_column)
 duplicates_df = clean_df[clean_df["Количество дублей"] > 1].sort_values(
     ["_filial_key", "_res_key", "_district_key", "_np_key"]
 )
-suspicious_df = find_suspicious_pairs(clean_df, col_map)
-summary_df = build_summary(clean_df, suspicious_df, col_map)
+suspicious_df = find_suspicious_pairs(clean_df, col_map, parse_column)
+summary_df = build_summary(clean_df, suspicious_df, col_map, parse_column)
 
 left, middle, right = st.columns(3)
 left.metric("Всего строк", len(clean_df))
