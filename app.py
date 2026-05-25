@@ -20,6 +20,8 @@ ADDRESS_STOP_RE = re.compile(r"(?i)\b(фио|заявитель|потребит
 ADDRESS_TAIL_RE = re.compile(r"\b(ул|улица|пер|переулок|пр|проспект|д|дом|корп|корпус|кв|квартира|шоссе|тракт|набережная)\b", re.IGNORECASE)
 REGION_WORDS = ["республика татарстан", "респ татарстан", "татарстан", "рт", "муниципальный район", "район", "р н", "мр"]
 BLOCKED_KEYS = {"татарстан", "республика татарстан", "респ татарстан", "рт"}
+TYPE_PREFIX_RE = re.compile(r"^(жд\s+ст|нп|пгт|снт|г|с|д|п)\s+")
+TYPED_RE = re.compile(r"^(г|с|д|п|нп|пгт|снт)\s+|^жд\s+ст\s+")
 
 
 def compact_text(value: object) -> str:
@@ -29,8 +31,7 @@ def compact_text(value: object) -> str:
 
 
 def normalize_text(value: object) -> str:
-    text = compact_text(value).lower()
-    text = text.replace("«", " ").replace("»", " ")
+    text = compact_text(value).lower().replace("«", " ").replace("»", " ")
     text = re.sub(r"[\"'`.,;:()№/\\\-]+", " ", text)
     for word in REGION_WORDS:
         text = re.sub(rf"\b{re.escape(word)}\b", " ", text)
@@ -41,10 +42,7 @@ def normalize_text(value: object) -> str:
 
 
 def strip_np_type(value: str) -> str:
-    text = normalize_text(value)
-    for pattern in [r"^жд\s+ст\s+", r"^нп\s+", r"^пгт\s+", r"^снт\s+", r"^г\s+", r"^с\s+", r"^д\s+", r"^п\s+"]:
-        text = re.sub(pattern, "", text)
-    return text.strip()
+    return TYPE_PREFIX_RE.sub("", normalize_text(value)).strip()
 
 
 def clean_reference_value(value: object) -> str:
@@ -55,8 +53,7 @@ def clean_reference_value(value: object) -> str:
     text = text.replace("“", "«").replace("”", "»").replace('"', "«")
     snt_match = re.match(r"(?i)^снт\s+[«\"]?(.+?)[»\"]?$", text)
     if snt_match:
-        name = snt_match.group(1).strip(" «»\"")
-        return f"СНТ «{name}»"
+        return f"СНТ «{snt_match.group(1).strip(' «»\"')}»"
 
     replacements = [
         (r"(?i)^н\s*\.?\s*п\s*\.?\s+", "н.п. "),
@@ -77,7 +74,7 @@ def is_bad_reference_key(key: str) -> bool:
 
 
 def is_typed_reference(key: str) -> bool:
-    return bool(re.match(r"^(г|с|д|п|нп|пгт|снт)\s+", key) or re.match(r"^жд\s+ст\s+", key))
+    return bool(TYPED_RE.match(key or ""))
 
 
 def is_short_city_reference(key: str) -> bool:
@@ -106,11 +103,10 @@ def make_address_candidates(address: object) -> list[str]:
     if not text:
         return []
 
-    raw_parts = [text]
-    raw_parts.extend(re.split(r"[,;\n\r]+", text))
-
+    parts = [text, *re.split(r"[,;\n\r]+", text)]
     candidates: list[str] = []
-    for part in raw_parts:
+
+    for part in parts:
         normalized = normalize_text(part)
         if normalized:
             candidates.append(normalized)
@@ -119,13 +115,7 @@ def make_address_candidates(address: object) -> list[str]:
         if head:
             candidates.append(head)
 
-    unique: list[str] = []
-    seen = set()
-    for candidate in candidates:
-        if candidate and candidate not in seen:
-            unique.append(candidate)
-            seen.add(candidate)
-    return unique
+    return list(dict.fromkeys(candidates))
 
 
 def load_reference() -> pd.DataFrame:
@@ -143,28 +133,103 @@ def find_reference_column(df: pd.DataFrame) -> str:
     return text_columns[0] if text_columns else df.columns[0]
 
 
-def build_reference(df: pd.DataFrame, column: str) -> list[dict[str, object]]:
+def build_reference_index(df: pd.DataFrame, column: str) -> dict[str, object]:
     values = df[column].dropna().map(compact_text)
     values = values[values != ""].drop_duplicates().tolist()
 
-    reference: list[dict[str, object]] = []
+    items: list[dict[str, object]] = []
+    exact_index: dict[str, dict[str, object]] = {}
+    name_index: dict[str, dict[str, object]] = {}
+    fuzzy_choices: dict[str, dict[str, object]] = {}
+
     for value in values:
         full_key = normalize_text(value)
         if is_bad_reference_key(full_key):
             continue
 
-        reference.append({
+        name_key = strip_np_type(full_key)
+        item = {
             "result": clean_reference_value(value),
             "full_key": full_key,
-            "name_key": strip_np_type(full_key),
+            "name_key": name_key,
             "typed": is_typed_reference(full_key),
             "short_city": is_short_city_reference(full_key),
-        })
+        }
+        items.append(item)
+        exact_index[full_key] = item
 
-    return sorted(reference, key=lambda item: len(str(item["full_key"])), reverse=True)
+        if item["typed"] and name_key and not item["short_city"]:
+            name_index[name_key] = item
+            fuzzy_choices[name_key] = item
+
+        fuzzy_choices[full_key] = item
+
+    items.sort(key=lambda row: len(str(row["full_key"])), reverse=True)
+    fuzzy_keys = list(fuzzy_choices.keys())
+    return {"items": items, "exact": exact_index, "names": name_index, "fuzzy": fuzzy_choices, "fuzzy_keys": fuzzy_keys}
 
 
-def find_settlement_in_address(address: str, reference: list[dict[str, object]]) -> dict[str, object]:
+def allowed_for_address(item: dict[str, object], address_key: str, address_has_street: bool) -> bool:
+    if address_has_street and item["short_city"] and address_key != item["full_key"]:
+        return False
+    return True
+
+
+def lookup_exact(candidates: list[str], ref: dict[str, object], address_key: str, address_has_street: bool) -> dict[str, object] | None:
+    exact_index = ref["exact"]
+    name_index = ref["names"]
+
+    for candidate in candidates:
+        item = exact_index.get(candidate)
+        if item and allowed_for_address(item, address_key, address_has_street):
+            return {"value": item["result"], "score": 100, "status": "найдено после адреса"}
+
+        item = name_index.get(candidate)
+        if item and allowed_for_address(item, address_key, address_has_street):
+            return {"value": item["result"], "score": 99, "status": "найдено название после адреса"}
+
+    return None
+
+
+def lookup_substring(candidates: list[str], ref: dict[str, object], address_key: str, address_has_street: bool) -> dict[str, object] | None:
+    for candidate in candidates:
+        for item in ref["items"]:
+            if not allowed_for_address(item, address_key, address_has_street):
+                continue
+
+            full_key = str(item["full_key"])
+            name_key = str(item["name_key"])
+
+            if full_key and re.search(rf"\b{re.escape(full_key)}\b", candidate):
+                return {"value": item["result"], "score": 100, "status": "найдено внутри адреса"}
+
+            if item["typed"] and name_key and not item["short_city"] and re.search(rf"\b{re.escape(name_key)}\b", candidate):
+                return {"value": item["result"], "score": 99, "status": "найдено название внутри адреса"}
+
+    return None
+
+
+def lookup_fuzzy(candidates: list[str], ref: dict[str, object], address_key: str, address_has_street: bool) -> dict[str, object] | None:
+    best_result = None
+    fuzzy_keys = ref["fuzzy_keys"]
+    fuzzy_index = ref["fuzzy"]
+
+    for candidate in candidates:
+        best = process.extractOne(candidate, fuzzy_keys, scorer=fuzz.WRatio) if fuzzy_keys else None
+        if not best or best[1] < MATCH_THRESHOLD:
+            continue
+
+        item = fuzzy_index[best[0]]
+        if not allowed_for_address(item, address_key, address_has_street):
+            continue
+
+        if best_result is None or best[1] > best_result["score"]:
+            best_result = {"value": item["result"], "score": round(best[1], 1), "status": "совпадение от 94% после адреса"}
+
+    return best_result
+
+
+def find_settlement_in_address(address: str, ref: dict[str, object]) -> dict[str, object]:
     address_key = normalize_text(address)
     if not address_key:
         return {"value": "", "score": 0, "status": "пустой блок адреса"}
@@ -172,54 +237,19 @@ def find_settlement_in_address(address: str, reference: list[dict[str, object]])
     address_has_street = bool(ADDRESS_TAIL_RE.search(address_key))
     candidates = make_address_candidates(address)
 
-    for candidate in candidates:
-        for item in reference:
-            full_key = str(item["full_key"])
-            name_key = str(item["name_key"])
-            short_city = bool(item["short_city"])
-            typed = bool(item["typed"])
+    for lookup in (lookup_exact, lookup_substring, lookup_fuzzy):
+        result = lookup(candidates, ref, address_key, address_has_street)
+        if result:
+            return result
 
-            if address_has_street and short_city and address_key != full_key:
-                continue
-
-            if candidate == full_key or re.search(rf"\b{re.escape(full_key)}\b", candidate):
-                return {"value": item["result"], "score": 100, "status": "найдено после адреса"}
-
-            if typed and name_key and not short_city and re.search(rf"\b{re.escape(name_key)}\b", candidate):
-                return {"value": item["result"], "score": 99, "status": "найдено название после адреса"}
-
-    choices: dict[str, dict[str, object]] = {}
-    for item in reference:
-        full_key = str(item["full_key"])
-        name_key = str(item["name_key"])
-        short_city = bool(item["short_city"])
-        typed = bool(item["typed"])
-
-        if address_has_street and short_city and address_key != full_key:
-            continue
-
-        choices[full_key] = item
-        if typed and name_key and not short_city:
-            choices[name_key] = item
-
-    best_result = None
-    for candidate in candidates:
-        best = process.extractOne(candidate, list(choices.keys()), scorer=fuzz.WRatio) if choices else None
-        if not best or best[1] < MATCH_THRESHOLD:
-            continue
-
-        item = choices[best[0]]
-        if best_result is None or best[1] > best_result["score"]:
-            best_result = {"value": item["result"], "score": round(best[1], 1), "status": "совпадение от 94% после адреса"}
-
-    return best_result or {"value": "", "score": 0, "status": "НП не найден после адреса"}
+    return {"value": "", "score": 0, "status": "НП не найден после адреса"}
 
 
-def match_cell(value: object, reference: list[dict[str, object]]) -> dict[str, object]:
+def match_cell(value: object, ref: dict[str, object]) -> dict[str, object]:
     address = extract_address_block(value)
     if not address:
         return {"value": "", "score": 0, "status": "нет блока адреса"}
-    return find_settlement_in_address(address, reference)
+    return find_settlement_in_address(address, ref)
 
 
 def read_excel_sheets(uploaded_file) -> dict[str, pd.DataFrame]:
@@ -244,9 +274,9 @@ def choose_columns(df: pd.DataFrame) -> tuple[str, str]:
     return source_column, result_column
 
 
-def analyze_dataframe(df: pd.DataFrame, source_column: str, result_column: str, reference: list[dict[str, object]]) -> pd.DataFrame:
+def analyze_dataframe(df: pd.DataFrame, source_column: str, result_column: str, ref: dict[str, object]) -> pd.DataFrame:
     result = df.copy()
-    matches = result[source_column].apply(lambda value: match_cell(value, reference))
+    matches = result[source_column].apply(lambda value: match_cell(value, ref))
     match_df = pd.DataFrame(list(matches))
 
     result[result_column] = match_df["value"]
@@ -300,11 +330,11 @@ def make_excel(parsed_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def load_current_reference() -> tuple[pd.DataFrame, str, list[dict[str, object]]]:
+def load_current_reference() -> tuple[pd.DataFrame, str, dict[str, object]]:
     reference_df = load_reference()
     ref_column = find_reference_column(reference_df)
-    reference = build_reference(reference_df, ref_column)
-    return reference_df, ref_column, reference
+    ref = build_reference_index(reference_df, ref_column)
+    return reference_df, ref_column, ref
 
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -312,14 +342,14 @@ st.title(APP_TITLE)
 st.caption("Поиск НП выполняется только в тексте после слова 'адрес'. Справочник Google перечитывается перед каждым анализом.")
 
 try:
-    preview_reference_df, preview_ref_column, preview_reference = load_current_reference()
+    preview_reference_df, preview_ref_column, preview_ref = load_current_reference()
 except Exception as error:
     st.error(f"Не удалось загрузить справочник: {error}")
     st.stop()
 
 with st.expander("Справочник", expanded=False):
     st.write(f"Столбец справочника: {preview_ref_column}")
-    st.write(f"Значений после фильтрации: {len(preview_reference)}")
+    st.write(f"Значений после фильтрации: {len(preview_ref['items'])}")
     st.dataframe(preview_reference_df.head(20), use_container_width=True)
 
 uploaded_file = st.file_uploader("Загрузите Excel файл", type=["xlsx", "xls"])
@@ -348,13 +378,13 @@ if not st.button("Запустить анализ", type="primary"):
     st.stop()
 
 try:
-    _, ref_column, reference = load_current_reference()
+    _, ref_column, ref = load_current_reference()
 except Exception as error:
     st.error(f"Не удалось обновить справочник перед анализом: {error}")
     st.stop()
 
-parsed_df = analyze_dataframe(source_df, source_column, result_column, reference)
-summary_df = build_summary(parsed_df, source_column, result_column, ref_column, len(reference))
+parsed_df = analyze_dataframe(source_df, source_column, result_column, ref)
+summary_df = build_summary(parsed_df, source_column, result_column, ref_column, len(ref["items"]))
 
 left, middle, right = st.columns(3)
 left.metric("Всего строк", len(parsed_df))
