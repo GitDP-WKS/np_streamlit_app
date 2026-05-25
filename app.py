@@ -30,7 +30,11 @@ ADDRESS_MARKERS = [
     "кв", "квартира", "зд", "здание", "стр", "строение", "ш", "шоссе", "тракт",
     "пл", "площадь", "бульвар", "б р", "наб", "набережная"
 ]
-SETTLEMENT_TYPE_TOKENS = {"г", "с", "д", "п", "нп", "пгт", "снт", "жд"}
+SETTLEMENT_TYPE_TOKENS = {"г", "с", "д", "п", "нп", "пгт", "снт", "жд", "жд ст"}
+REGION_WORDS = [
+    "республика татарстан", "респ татарстан", "татарстан", "рт",
+    "муниципальный район", "район", "р н", "мр"
+]
 BLOCKED_REFERENCE_KEYS = {
     "татарстан",
     "республика татарстан",
@@ -51,9 +55,8 @@ def normalize_for_match(value: object) -> str:
     text = compact_text(value).lower()
     text = text.replace("«", " ").replace("»", " ")
     text = re.sub(r"[\"'`.,;:()№/\\\-]+", " ", text)
-    text = re.sub(r"\bреспублика\s+татарстан\b", " ", text)
-    text = re.sub(r"\bресп\s+татарстан\b", " ", text)
-    text = re.sub(r"\bрт\b", " ", text)
+    for word in REGION_WORDS:
+        text = re.sub(rf"\b{re.escape(word)}\b", " ", text)
     text = re.sub(r"\bн\s*п\b", "нп", text)
     text = re.sub(r"\bп\s*г\s*т\b", "пгт", text)
     text = re.sub(r"\bж\s*д\s*ст\b", "жд ст", text)
@@ -61,17 +64,25 @@ def normalize_for_match(value: object) -> str:
     return text.strip()
 
 
+def strip_settlement_type(value: str) -> str:
+    text = normalize_for_match(value)
+    patterns = [
+        r"^жд\s+ст\s+",
+        r"^нп\s+",
+        r"^пгт\s+",
+        r"^снт\s+",
+        r"^г\s+",
+        r"^с\s+",
+        r"^д\s+",
+        r"^п\s+",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "", text)
+    return text.strip()
+
+
 def has_address_marker(normalized_text: str) -> bool:
     return any(re.search(rf"\b{re.escape(marker)}\b", normalized_text) for marker in ADDRESS_MARKERS)
-
-
-def token_count(value: str) -> int:
-    return len([part for part in value.split() if part])
-
-
-def starts_with_settlement_type(value: str) -> bool:
-    parts = value.split()
-    return bool(parts and parts[0] in SETTLEMENT_TYPE_TOKENS)
 
 
 def is_city_or_bare_short_reference(full_key: str) -> bool:
@@ -93,6 +104,13 @@ def is_blocked_reference(full_key: str) -> bool:
     if "татарстан" in full_key:
         return True
     return False
+
+
+def is_typed_reference(full_key: str) -> bool:
+    return bool(
+        re.match(r"^(г|с|д|п|нп|пгт|снт)\s+", full_key or "")
+        or re.match(r"^жд\s+ст\s+", full_key or "")
+    )
 
 
 def format_snt_quotes(value: object) -> str:
@@ -159,12 +177,15 @@ def build_reference_dict(ref_df: pd.DataFrame, ref_column: str) -> list[dict[str
         full_key = normalize_for_match(value)
         if is_blocked_reference(full_key):
             continue
+        name_key = strip_settlement_type(full_key)
         reference.append(
             {
                 "original": value,
                 "clean": clean_np(value),
                 "full_key": full_key,
+                "name_key": name_key,
                 "is_city_or_bare_short": is_city_or_bare_short_reference(full_key),
+                "is_typed": is_typed_reference(full_key),
             }
         )
 
@@ -183,6 +204,83 @@ def is_reference_allowed_for_cell(item: dict[str, str], cell_key: str, address_l
     return True
 
 
+def split_cell_to_candidates(raw_text: object) -> list[str]:
+    text = compact_text(raw_text)
+    if not text:
+        return []
+
+    pieces = re.split(r"[,;\n\r]+", text)
+    candidates = [normalize_for_match(text)]
+
+    for piece in pieces:
+        normalized = normalize_for_match(piece)
+        if normalized:
+            candidates.append(normalized)
+
+        no_address_tail = re.split(
+            r"\b(ул|улица|пер|переулок|пр|проспект|д|дом|корп|корпус|кв|квартира|зд|здание|стр|строение|шоссе|тракт|набережная)\b",
+            normalized,
+            maxsplit=1,
+        )[0].strip()
+        if no_address_tail:
+            candidates.append(no_address_tail)
+
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if candidate and candidate not in seen:
+            unique_candidates.append(candidate)
+            seen.add(candidate)
+    return unique_candidates
+
+
+def exact_candidate_match(candidates: list[str], reference: list[dict[str, str]], address_like: bool) -> dict[str, object] | None:
+    for candidate in candidates:
+        for item in reference:
+            full_key = item["full_key"]
+            if not full_key or not is_reference_allowed_for_cell(item, candidate, address_like):
+                continue
+
+            if candidate == full_key or re.search(rf"\b{re.escape(full_key)}\b", candidate):
+                return {"value": item["clean"], "score": 100, "status": "точное совпадение"}
+
+            name_key = item["name_key"]
+            if item["is_typed"] and name_key and re.search(rf"\b{re.escape(name_key)}\b", candidate):
+                if not (address_like and item["is_city_or_bare_short"]):
+                    return {"value": item["clean"], "score": 99, "status": "точное название НП"}
+
+    return None
+
+
+def fuzzy_candidate_match(candidates: list[str], reference: list[dict[str, str]], address_like: bool) -> dict[str, object] | None:
+    allowed_reference = [item for item in reference if is_reference_allowed_for_cell(item, " ".join(candidates), address_like)]
+    if not allowed_reference:
+        return None
+
+    choices = {}
+    for item in allowed_reference:
+        if item["full_key"]:
+            choices[item["full_key"]] = item
+        if item["is_typed"] and item["name_key"] and not item["is_city_or_bare_short"]:
+            choices[item["name_key"]] = item
+
+    best_result = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        best = process.extractOne(candidate, list(choices.keys()), scorer=fuzz.WRatio) if choices else None
+        if not best:
+            continue
+        best_key, score, _ = best
+        if score >= MATCH_THRESHOLD:
+            if best_result is None or score > best_result["score"]:
+                item = choices[best_key]
+                best_result = {"value": item["clean"], "score": round(score, 1), "status": "совпадение от 94%"}
+
+    return best_result
+
+
 def match_reference_cell(raw_value: object, reference: list[dict[str, str]]) -> dict[str, object]:
     raw_text = compact_text(raw_value)
     if not raw_text:
@@ -193,27 +291,15 @@ def match_reference_cell(raw_value: object, reference: list[dict[str, str]]) -> 
         return {"value": "", "score": 0, "status": "пусто"}
 
     address_like = has_address_marker(cell_key)
+    candidates = split_cell_to_candidates(raw_text)
 
-    for item in reference:
-        full_key = item["full_key"]
-        if not full_key or not is_reference_allowed_for_cell(item, cell_key, address_like):
-            continue
+    exact_match = exact_candidate_match(candidates, reference, address_like)
+    if exact_match:
+        return exact_match
 
-        if cell_key == full_key or re.search(rf"\b{re.escape(full_key)}\b", cell_key):
-            return {"value": item["clean"], "score": 100, "status": "точное совпадение"}
-
-    choices = {
-        item["full_key"]: item
-        for item in reference
-        if item["full_key"] and is_reference_allowed_for_cell(item, cell_key, address_like)
-    }
-    best = process.extractOne(cell_key, list(choices.keys()), scorer=fuzz.WRatio) if choices else None
-
-    if best:
-        best_key, score, _ = best
-        if score >= MATCH_THRESHOLD:
-            item = choices[best_key]
-            return {"value": item["clean"], "score": round(score, 1), "status": "совпадение от 94%"}
+    fuzzy_match = fuzzy_candidate_match(candidates, reference, address_like)
+    if fuzzy_match:
+        return fuzzy_match
 
     return {"value": "", "score": 0, "status": "совпадение ниже 94% или адрес без НП"}
 
@@ -336,7 +422,7 @@ st.title(APP_TITLE)
 st.caption(
     "Приложение анализирует выбранную ячейку и записывает только конкретный населенный пункт "
     "из эталонного Google справочника. Совпадение от 94% считается точным. "
-    "Татарстан как регион не записывается. Если в ячейке только адрес города без явного НП из справочника, результат остается пустым."
+    "Алгоритм ищет НП внутри длинных адресов, но не подставляет регион Татарстан как результат."
 )
 
 try:
