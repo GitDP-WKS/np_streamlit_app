@@ -12,7 +12,7 @@ DEFAULT_SCORE_COLUMN = "Точность НП"
 DEFAULT_STATUS_COLUMN = "Статус парсинга НП"
 MATCH_THRESHOLD = 82
 
-REFERENCE_URL = (
+DEFAULT_REFERENCE_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1UhrxXABHp5yrtiAm7excLPicHhlgZrgN7-8R3Ada9ZY/export?format=xlsx&gid=0"
 )
@@ -30,6 +30,24 @@ def compact_text(value: object) -> str:
     text = str(value).replace("ё", "е").strip()
     text = re.sub(r"\s+", " ", text)
     return text
+
+
+def google_sheet_to_export_url(url: str) -> str:
+    url = compact_text(url)
+    if not url:
+        return ""
+
+    if "export?format=xlsx" in url:
+        return url
+
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+    if not match:
+        return url
+
+    file_id = match.group(1)
+    gid_match = re.search(r"gid=([0-9]+)", url)
+    gid = gid_match.group(1) if gid_match else "0"
+    return f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx&gid={gid}"
 
 
 def normalize_for_match(value: object) -> str:
@@ -86,8 +104,9 @@ def read_excel_sheets(uploaded_file) -> dict[str, pd.DataFrame]:
 
 
 @st.cache_data(show_spinner=False)
-def load_reference() -> pd.DataFrame:
-    return pd.read_excel(REFERENCE_URL)
+def load_reference(reference_url: str) -> pd.DataFrame:
+    export_url = google_sheet_to_export_url(reference_url)
+    return pd.read_excel(export_url)
 
 
 def find_reference_column(ref_df: pd.DataFrame) -> str:
@@ -271,10 +290,23 @@ st.caption(
     "который есть в эталонном Google справочнике."
 )
 
+st.subheader("Образцовый Google документ")
+reference_url_input = st.text_input(
+    "Ссылка на Google Sheets со справочником НП",
+    value=DEFAULT_REFERENCE_URL,
+    help="Можно вставить обычную ссылку на Google Sheets или export-ссылку. Документ должен быть доступен по ссылке.",
+)
+
+reference_url = google_sheet_to_export_url(reference_url_input)
+if not reference_url:
+    st.error("Укажите ссылку на образцовый Google документ.")
+    st.stop()
+
 try:
-    reference_df = load_reference()
+    reference_df = load_reference(reference_url)
 except Exception as error:
     st.error(f"Не удалось загрузить Google справочник: {error}")
+    st.caption("Проверьте, что документ открыт для просмотра по ссылке и содержит таблицу со справочником НП.")
     st.stop()
 
 ref_column = find_reference_column(reference_df)
