@@ -4,10 +4,9 @@ from typing import Iterable
 
 import pandas as pd
 import streamlit as st
-from rapidfuzz import fuzz
 
 
-APP_TITLE = "Проверка населенных пунктов"
+APP_TITLE = "Парсинг населенных пунктов"
 
 PRIMARY_COLUMNS = {
     "filial_new": ["Филиал новый", "Новый филиал", "Филиал_новый"],
@@ -26,7 +25,6 @@ FIELD_LABELS = {
 }
 
 OLD_COLUMNS = ["Филиал", "РЭС"]
-FUZZY_LIMIT = 92
 DEFAULT_PARSE_COLUMN = "НП очищенный"
 
 
@@ -51,18 +49,6 @@ def compact_text(value: object) -> str:
     text = str(value).replace("ё", "е").strip()
     text = re.sub(r"\s+", " ", text)
     return text
-
-
-def normalize_np_key(value: object) -> str:
-    text = compact_text(value).lower()
-    text = text.replace("«", '"').replace("»", '"')
-    text = re.sub(r"[\"'`.,;:()№]+", " ", text)
-    text = re.sub(r"\bн\s*\.?\s*п\s*\.?\b", "нп", text)
-    text = re.sub(r"\bп\s*\.?\s*г\s*\.?\s*т\s*\.?\b", "пгт", text)
-    text = re.sub(r"\bж\s*/?\s*д\s*\.?\s*ст\s*\.?\b", "жд ст", text)
-    text = re.sub(r"\b(г|с|д|п)\s*\.\s*", r"\1 ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
 
 
 def format_snt_quotes(value: object) -> str:
@@ -107,10 +93,7 @@ def build_auto_column_map(df: pd.DataFrame) -> dict[str, str | None]:
 
 def column_selectbox(label: str, columns: list[str], suggested: str | None, key: str, required: bool = True) -> str | None:
     options = columns if required else ["Не использовать"] + columns
-    if suggested in options:
-        index = options.index(suggested)
-    else:
-        index = 0
+    index = options.index(suggested) if suggested in options else 0
 
     value = st.selectbox(label, options, index=index, key=key)
     if value == "Не использовать":
@@ -140,12 +123,14 @@ def choose_columns(df: pd.DataFrame) -> dict[str, str | None]:
             columns,
             auto_map.get("filial_new"),
             "select_filial_new",
+            required=False,
         )
         district = column_selectbox(
             "Столбец с районом",
             columns,
             auto_map.get("district"),
             "select_district",
+            required=False,
         )
     with right:
         res_new = column_selectbox(
@@ -153,16 +138,18 @@ def choose_columns(df: pd.DataFrame) -> dict[str, str | None]:
             columns,
             auto_map.get("res_new"),
             "select_res_new",
+            required=False,
         )
         np_col = column_selectbox(
             "Столбец, который нужно парсить",
             columns,
             auto_map.get("np"),
             "select_np_col",
+            required=True,
         )
 
     status_col = column_selectbox(
-        "Столбец со статусом НП, если есть. В дублях не используется",
+        "Столбец со статусом НП, если есть",
         columns,
         auto_map.get("status"),
         "select_status_col",
@@ -209,129 +196,53 @@ def choose_parse_output(df: pd.DataFrame) -> tuple[str, bool]:
 
 
 def validate_required_columns(col_map: dict[str, str | None]) -> list[str]:
-    missing = []
-    for key in ["filial_new", "res_new", "district", "np"]:
-        if not col_map.get(key):
-            missing.append(FIELD_LABELS[key])
-    return missing
+    if not col_map.get("np"):
+        return [FIELD_LABELS["np"]]
+    return []
 
 
 def prepare_dataframe(df: pd.DataFrame, col_map: dict[str, str | None], parse_column: str) -> pd.DataFrame:
     result = df.copy()
-
     np_col = col_map["np"]
     result[parse_column] = result[np_col].apply(clean_np)
-    result["_np_key"] = result[parse_column].apply(normalize_np_key)
-
-    for key, output_col in [
-        ("filial_new", "_filial_key"),
-        ("res_new", "_res_key"),
-        ("district", "_district_key"),
-    ]:
-        source_col = col_map[key]
-        result[output_col] = result[source_col].apply(lambda x: compact_text(x).lower())
-
-    duplicate_basis = ["_filial_key", "_res_key", "_district_key", "_np_key"]
-    result["Группа дубля"] = result.groupby(duplicate_basis, dropna=False).ngroup() + 1
-    result["Количество дублей"] = result.groupby(duplicate_basis, dropna=False)["_np_key"].transform("size")
-    result["Статус проверки"] = result["Количество дублей"].apply(
-        lambda count: "дубль" if count > 1 else "уникально"
-    )
 
     drop_candidates = [
         col for col in OLD_COLUMNS
-        if col in result.columns and col not in {col_map["filial_new"], col_map["res_new"]}
+        if col in result.columns and col not in {col_map.get("filial_new"), col_map.get("res_new")}
     ]
     result = result.drop(columns=drop_candidates, errors="ignore")
 
     return result
 
 
-def find_suspicious_pairs(df: pd.DataFrame, col_map: dict[str, str | None], parse_column: str) -> pd.DataFrame:
-    rows = []
-    group_cols = ["_filial_key", "_res_key", "_district_key"]
-
-    for _, group in df.groupby(group_cols, dropna=False):
-        unique_names = (
-            group[["_np_key", parse_column]]
-            .dropna()
-            .drop_duplicates()
-            .query("_np_key != ''")
-            .to_dict("records")
-        )
-
-        for i, left in enumerate(unique_names):
-            for right in unique_names[i + 1:]:
-                score = fuzz.WRatio(left["_np_key"], right["_np_key"])
-                if score >= FUZZY_LIMIT and left["_np_key"] != right["_np_key"]:
-                    rows.append(
-                        {
-                            "Филиал новый": group[col_map["filial_new"]].iloc[0],
-                            "РЭС новый": group[col_map["res_new"]].iloc[0],
-                            "Район": group[col_map["district"]].iloc[0],
-                            "Вариант 1": left[parse_column],
-                            "Вариант 2": right[parse_column],
-                            "Похожесть": round(score, 1),
-                            "Комментарий": "возможная разница в написании",
-                        }
-                    )
-
-    return pd.DataFrame(rows)
-
-
-def build_summary(
-    df: pd.DataFrame,
-    suspicious_df: pd.DataFrame,
-    col_map: dict[str, str | None],
-    parse_column: str,
-) -> pd.DataFrame:
-    rows_total = len(df)
-    duplicate_rows = int((df["Количество дублей"] > 1).sum())
-    duplicate_groups = int(df.loc[df["Количество дублей"] > 1, "Группа дубля"].nunique())
-    empty_np = int((df["_np_key"] == "").sum())
+def build_summary(df: pd.DataFrame, col_map: dict[str, str | None], parse_column: str) -> pd.DataFrame:
+    parsed_empty = int((df[parse_column].astype(str).str.strip() == "").sum())
 
     return pd.DataFrame(
         [
-            {"Показатель": "Всего строк", "Значение": rows_total},
-            {"Показатель": "Строк в дублях", "Значение": duplicate_rows},
-            {"Показатель": "Групп дублей", "Значение": duplicate_groups},
-            {"Показатель": "Пустых населенных пунктов", "Значение": empty_np},
-            {"Показатель": "Подозрительных похожих пар", "Значение": len(suspicious_df)},
-            {"Показатель": "Колонка филиала", "Значение": col_map["filial_new"]},
-            {"Показатель": "Колонка РЭС", "Значение": col_map["res_new"]},
-            {"Показатель": "Колонка района", "Значение": col_map["district"]},
+            {"Показатель": "Всего строк", "Значение": len(df)},
+            {"Показатель": "Пустых результатов парсинга", "Значение": parsed_empty},
             {"Показатель": "Колонка для парсинга", "Значение": col_map["np"]},
             {"Показатель": "Колонка результата парсинга", "Значение": parse_column},
+            {"Показатель": "Колонка филиала", "Значение": col_map.get("filial_new") or "не используется"},
+            {"Показатель": "Колонка РЭС", "Значение": col_map.get("res_new") or "не используется"},
+            {"Показатель": "Колонка района", "Значение": col_map.get("district") or "не используется"},
             {"Показатель": "Колонка статуса НП", "Значение": col_map.get("status") or "не используется"},
         ]
     )
 
 
-def public_columns(df: pd.DataFrame) -> pd.DataFrame:
-    service_cols = [col for col in df.columns if col.startswith("_")]
-    return df.drop(columns=service_cols, errors="ignore")
-
-
-def make_excel(
-    clean_df: pd.DataFrame,
-    duplicates_df: pd.DataFrame,
-    suspicious_df: pd.DataFrame,
-    summary_df: pd.DataFrame,
-) -> bytes:
+def make_excel(parsed_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        public_columns(clean_df).to_excel(writer, index=False, sheet_name="Исправленный файл")
-        public_columns(duplicates_df).to_excel(writer, index=False, sheet_name="Дубли")
-        suspicious_df.to_excel(writer, index=False, sheet_name="Подозрительные")
+        parsed_df.to_excel(writer, index=False, sheet_name="Исправленный файл")
         summary_df.to_excel(writer, index=False, sheet_name="Сводка")
 
         workbook = writer.book
         header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
 
         for sheet_name, sheet_df in {
-            "Исправленный файл": public_columns(clean_df),
-            "Дубли": public_columns(duplicates_df),
-            "Подозрительные": suspicious_df,
+            "Исправленный файл": parsed_df,
             "Сводка": summary_df,
         }.items():
             worksheet = writer.sheets[sheet_name]
@@ -341,11 +252,6 @@ def make_excel(
                 worksheet.set_column(col_num, col_num, width)
             worksheet.freeze_panes(1, 0)
 
-        if not duplicates_df.empty:
-            writer.sheets["Дубли"].set_tab_color("#70AD47")
-        if not suspicious_df.empty:
-            writer.sheets["Подозрительные"].set_tab_color("#FFC000")
-
     return output.getvalue()
 
 
@@ -353,14 +259,14 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
 st.caption(
-    "Приложение проверяет файл по актуальной логике: новые колонки филиала и РЭС, район, населенный пункт. "
-    "Статус населенного пункта не участвует в поиске дублей."
+    "Приложение очищает выбранный столбец с населенными пунктами и записывает результат в выбранную колонку. "
+    "Анализ дублей полностью удален."
 )
 
 uploaded_file = st.file_uploader("Загрузите Excel файл", type=["xlsx", "xls"])
 
 if not uploaded_file:
-    st.info("Загрузите файл, чтобы начать проверку.")
+    st.info("Загрузите файл, чтобы начать парсинг.")
     st.stop()
 
 try:
@@ -369,7 +275,7 @@ except Exception as error:
     st.error(f"Не удалось прочитать Excel файл: {error}")
     st.stop()
 
-sheet_name = st.selectbox("Выберите лист для проверки", list(sheets.keys()))
+sheet_name = st.selectbox("Выберите лист для обработки", list(sheets.keys()))
 source_df = sheets[sheet_name].copy()
 
 if source_df.empty:
@@ -387,48 +293,30 @@ if missing_columns:
     st.stop()
 
 parse_column, overwrite_existing = choose_parse_output(source_df)
-
-run_analysis = st.button("Запустить анализ", type="primary")
+run_analysis = st.button("Запустить парсинг", type="primary")
 
 if not run_analysis:
-    st.info("Выберите нужные столбцы, укажите колонку результата парсинга и нажмите кнопку анализа.")
+    st.info("Выберите столбец для парсинга, укажите колонку результата и нажмите кнопку запуска.")
     st.stop()
 
-clean_df = prepare_dataframe(source_df, col_map, parse_column)
-duplicates_df = clean_df[clean_df["Количество дублей"] > 1].sort_values(
-    ["_filial_key", "_res_key", "_district_key", "_np_key"]
-)
-suspicious_df = find_suspicious_pairs(clean_df, col_map, parse_column)
-summary_df = build_summary(clean_df, suspicious_df, col_map, parse_column)
+parsed_df = prepare_dataframe(source_df, col_map, parse_column)
+summary_df = build_summary(parsed_df, col_map, parse_column)
 
-left, middle, right = st.columns(3)
-left.metric("Всего строк", len(clean_df))
-middle.metric("Строк в дублях", len(duplicates_df))
-right.metric("Подозрительных пар", len(suspicious_df))
+left, right = st.columns(2)
+left.metric("Всего строк", len(parsed_df))
+right.metric("Пустых результатов", int(summary_df.loc[summary_df["Показатель"] == "Пустых результатов парсинга", "Значение"].iloc[0]))
 
 st.subheader("Сводка")
 st.dataframe(summary_df, use_container_width=True)
 
 st.subheader("Исправленный файл")
-st.dataframe(public_columns(clean_df), use_container_width=True, height=420)
+st.dataframe(parsed_df, use_container_width=True, height=480)
 
-st.subheader("Дубли")
-if duplicates_df.empty:
-    st.success("Полные дубли не найдены.")
-else:
-    st.dataframe(public_columns(duplicates_df), use_container_width=True, height=320)
-
-st.subheader("Подозрительные похожие написания")
-if suspicious_df.empty:
-    st.success("Подозрительные похожие варианты не найдены.")
-else:
-    st.dataframe(suspicious_df, use_container_width=True, height=320)
-
-excel_bytes = make_excel(clean_df, duplicates_df, suspicious_df, summary_df)
+excel_bytes = make_excel(parsed_df, summary_df)
 
 st.download_button(
     "Скачать результат Excel",
     data=excel_bytes,
-    file_name="np_check_result.xlsx",
+    file_name="np_parse_result.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
