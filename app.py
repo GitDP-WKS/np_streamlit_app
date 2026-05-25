@@ -55,7 +55,8 @@ def clean_np(value: object) -> str:
     text = text.replace("“", "«").replace("”", "»").replace('"', "«")
     m = re.match(r"(?i)^снт\s+[«\"]?(.+?)[»\"]?$", text)
     if m:
-        return f"СНТ «{m.group(1).strip(' «»\"')}»"
+        name = m.group(1).strip(" «»\"")
+        return f"СНТ «{name}»"
     replacements = [
         (r"(?i)^н\s*\.?\s*п\s*\.?\s+", "н.п. "),
         (r"(?i)^п\s*\.?\s*г\s*\.?\s*т\s*\.?\s+", "пгт "),
@@ -121,7 +122,6 @@ def split_address_to_candidates(address: object) -> list[str]:
     return result
 
 
-@st.cache_data(show_spinner=False)
 def load_reference() -> pd.DataFrame:
     return pd.read_excel(REFERENCE_URL)
 
@@ -278,7 +278,7 @@ def make_excel(parsed_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Поиск НП выполняется только в тексте после слова 'адрес'. Остальная часть ячейки не анализируется.")
+st.caption("Поиск НП выполняется только в тексте после слова 'адрес'. Справочник Google перечитывается при каждом запуске приложения.")
 
 try:
     reference_df = load_reference()
@@ -319,6 +319,9 @@ if not st.button("Запустить анализ", type="primary"):
     st.info("Выберите исходный столбец и столбец результата, затем нажмите кнопку запуска.")
     st.stop()
 
+reference_df = load_reference()
+ref_column = find_reference_column(reference_df)
+reference = build_reference(reference_df, ref_column)
 parsed_df = parse_dataframe(source_df, source_column, result_column, reference)
 summary_df = build_summary(parsed_df, source_column, result_column, ref_column, len(reference))
 
