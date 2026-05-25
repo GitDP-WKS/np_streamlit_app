@@ -27,8 +27,16 @@ DELETE_EXCEL_COLUMN_INDEXES = [41]  # AP в Excel, нумерация pandas с 
 HIDE_EXCEL_RANGES = ["A:B", "E:U", "Y:AM"]
 ADDRESS_MARKERS = [
     "ул", "улица", "пер", "переулок", "пр", "проспект", "д", "дом", "корп", "корпус",
-    "кв", "квартира", "зд", "здание", "стр", "строение", "ш", "шоссе", "тракт"
+    "кв", "квартира", "зд", "здание", "стр", "строение", "ш", "шоссе", "тракт",
+    "пл", "площадь", "бульвар", "б р", "наб", "набережная"
 ]
+SETTLEMENT_TYPE_TOKENS = {"г", "с", "д", "п", "нп", "пгт", "снт", "жд"}
+BLOCKED_REFERENCE_KEYS = {
+    "татарстан",
+    "республика татарстан",
+    "респ татарстан",
+    "рт",
+}
 
 
 def compact_text(value: object) -> str:
@@ -57,8 +65,34 @@ def has_address_marker(normalized_text: str) -> bool:
     return any(re.search(rf"\b{re.escape(marker)}\b", normalized_text) for marker in ADDRESS_MARKERS)
 
 
-def is_city_only_reference(full_key: str) -> bool:
-    return bool(re.fullmatch(r"г\s+\S+", full_key or ""))
+def token_count(value: str) -> int:
+    return len([part for part in value.split() if part])
+
+
+def starts_with_settlement_type(value: str) -> bool:
+    parts = value.split()
+    return bool(parts and parts[0] in SETTLEMENT_TYPE_TOKENS)
+
+
+def is_city_or_bare_short_reference(full_key: str) -> bool:
+    if not full_key:
+        return False
+    parts = full_key.split()
+    if len(parts) == 1:
+        return True
+    if len(parts) == 2 and parts[0] == "г":
+        return True
+    return False
+
+
+def is_blocked_reference(full_key: str) -> bool:
+    if not full_key:
+        return True
+    if full_key in BLOCKED_REFERENCE_KEYS:
+        return True
+    if "татарстан" in full_key:
+        return True
+    return False
 
 
 def format_snt_quotes(value: object) -> str:
@@ -123,17 +157,30 @@ def build_reference_dict(ref_df: pd.DataFrame, ref_column: str) -> list[dict[str
     reference = []
     for value in values:
         full_key = normalize_for_match(value)
+        if is_blocked_reference(full_key):
+            continue
         reference.append(
             {
                 "original": value,
                 "clean": clean_np(value),
                 "full_key": full_key,
-                "is_city_only": is_city_only_reference(full_key),
+                "is_city_or_bare_short": is_city_or_bare_short_reference(full_key),
             }
         )
 
     reference = sorted(reference, key=lambda item: len(item["full_key"]), reverse=True)
     return reference
+
+
+def is_reference_allowed_for_cell(item: dict[str, str], cell_key: str, address_like: bool) -> bool:
+    full_key = item["full_key"]
+    if is_blocked_reference(full_key):
+        return False
+
+    if address_like and item["is_city_or_bare_short"] and cell_key != full_key:
+        return False
+
+    return True
 
 
 def match_reference_cell(raw_value: object, reference: list[dict[str, str]]) -> dict[str, object]:
@@ -149,10 +196,7 @@ def match_reference_cell(raw_value: object, reference: list[dict[str, str]]) -> 
 
     for item in reference:
         full_key = item["full_key"]
-        if not full_key:
-            continue
-
-        if address_like and item["is_city_only"] and cell_key != full_key:
+        if not full_key or not is_reference_allowed_for_cell(item, cell_key, address_like):
             continue
 
         if cell_key == full_key or re.search(rf"\b{re.escape(full_key)}\b", cell_key):
@@ -161,7 +205,7 @@ def match_reference_cell(raw_value: object, reference: list[dict[str, str]]) -> 
     choices = {
         item["full_key"]: item
         for item in reference
-        if item["full_key"] and not (address_like and item["is_city_only"])
+        if item["full_key"] and is_reference_allowed_for_cell(item, cell_key, address_like)
     }
     best = process.extractOne(cell_key, list(choices.keys()), scorer=fuzz.WRatio) if choices else None
 
@@ -292,7 +336,7 @@ st.title(APP_TITLE)
 st.caption(
     "Приложение анализирует выбранную ячейку и записывает только конкретный населенный пункт "
     "из эталонного Google справочника. Совпадение от 94% считается точным. "
-    "Если в ячейке только адрес города без явного НП из справочника, результат остается пустым."
+    "Татарстан как регион не записывается. Если в ячейке только адрес города без явного НП из справочника, результат остается пустым."
 )
 
 try:
@@ -306,7 +350,7 @@ reference = build_reference_dict(reference_df, ref_column)
 
 with st.expander("Справочник Google", expanded=False):
     st.write(f"Используется столбец справочника: {ref_column}")
-    st.write(f"Уникальных значений: {len(reference)}")
+    st.write(f"Уникальных значений после фильтрации: {len(reference)}")
     st.dataframe(reference_df.head(20), use_container_width=True)
 
 uploaded_file = st.file_uploader("Загрузите Excel файл", type=["xlsx", "xls"])
