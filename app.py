@@ -3,14 +3,12 @@ import re
 
 import pandas as pd
 import streamlit as st
-from rapidfuzz import fuzz, process
 
 
 APP_TITLE = "Умный парсинг населенных пунктов"
 DEFAULT_RESULT_COLUMN = "НП из справочника"
 DEFAULT_SCORE_COLUMN = "Точность НП"
 DEFAULT_STATUS_COLUMN = "Статус парсинга НП"
-MATCH_THRESHOLD = 82
 
 REFERENCE_URL = (
     "https://docs.google.com/spreadsheets/d/"
@@ -40,12 +38,6 @@ def normalize_for_match(value: object) -> str:
     text = re.sub(r"\bп\s*г\s*т\b", "пгт", text)
     text = re.sub(r"\bж\s*д\s*ст\b", "жд ст", text)
     text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def normalize_name_only(value: object) -> str:
-    text = normalize_for_match(value)
-    text = re.sub(r"^(г|с|д|п|нп|пгт|жд ст|снт)\s+", "", text)
     return text.strip()
 
 
@@ -115,10 +107,10 @@ def build_reference_dict(ref_df: pd.DataFrame, ref_column: str) -> list[dict[str
                 "original": value,
                 "clean": clean_np(value),
                 "full_key": normalize_for_match(value),
-                "name_key": normalize_name_only(value),
             }
         )
 
+    reference = sorted(reference, key=lambda item: len(item["full_key"]), reverse=True)
     return reference
 
 
@@ -128,42 +120,18 @@ def match_reference_cell(raw_value: object, reference: list[dict[str, str]]) -> 
         return {"value": "", "score": 0, "status": "пусто"}
 
     cell_key = normalize_for_match(raw_text)
-    cell_name_key = normalize_name_only(raw_text)
-
     if not cell_key:
         return {"value": "", "score": 0, "status": "пусто"}
 
     for item in reference:
         full_key = item["full_key"]
-        name_key = item["name_key"]
+        if not full_key:
+            continue
 
-        if full_key and re.search(rf"\b{re.escape(full_key)}\b", cell_key):
-            return {"value": item["clean"], "score": 100, "status": "найдено точно"}
+        if cell_key == full_key or re.search(rf"\b{re.escape(full_key)}\b", cell_key):
+            return {"value": item["clean"], "score": 100, "status": "100% совпадение"}
 
-        if name_key and re.search(rf"\b{re.escape(name_key)}\b", cell_name_key):
-            return {"value": item["clean"], "score": 98, "status": "найдено по названию"}
-
-    choices = {item["full_key"]: item for item in reference if item["full_key"]}
-    best = process.extractOne(cell_key, list(choices.keys()), scorer=fuzz.WRatio)
-
-    if best:
-        best_key, score, _ = best
-        if score >= MATCH_THRESHOLD:
-            item = choices[best_key]
-            status = "найдено похоже" if score >= 90 else "требует проверки"
-            return {"value": item["clean"], "score": round(score, 1), "status": status}
-
-    name_choices = {item["name_key"]: item for item in reference if item["name_key"]}
-    best_name = process.extractOne(cell_name_key, list(name_choices.keys()), scorer=fuzz.WRatio)
-
-    if best_name:
-        best_key, score, _ = best_name
-        if score >= MATCH_THRESHOLD:
-            item = name_choices[best_key]
-            status = "найдено похоже" if score >= 90 else "требует проверки"
-            return {"value": item["clean"], "score": round(score, 1), "status": status}
-
-    return {"value": "", "score": 0, "status": "не найдено"}
+    return {"value": "", "score": 0, "status": "нет 100% совпадения"}
 
 
 def choose_columns(df: pd.DataFrame) -> tuple[str, str]:
@@ -224,14 +192,12 @@ def build_summary(
 ) -> pd.DataFrame:
     empty_result_count = int((df[result_column].astype(str).str.strip() == "").sum())
     found_count = len(df) - empty_result_count
-    check_count = int((df[DEFAULT_STATUS_COLUMN] == "требует проверки").sum())
 
     return pd.DataFrame(
         [
             {"Показатель": "Всего строк", "Значение": len(df)},
-            {"Показатель": "Найдено НП", "Значение": found_count},
-            {"Показатель": "Не найдено НП", "Значение": empty_result_count},
-            {"Показатель": "Требует проверки", "Значение": check_count},
+            {"Показатель": "Найдено 100% совпадений", "Значение": found_count},
+            {"Показатель": "Не найдено 100% совпадений", "Значение": empty_result_count},
             {"Показатель": "Исходный столбец", "Значение": source_column},
             {"Показатель": "Столбец результата", "Значение": result_column},
             {"Показатель": "Столбец справочника", "Значение": ref_column},
@@ -267,8 +233,8 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
 st.caption(
-    "Приложение анализирует выбранную ячейку и вытаскивает из нее только тот населенный пункт, "
-    "который есть в эталонном Google справочнике."
+    "Приложение анализирует выбранную ячейку и записывает населенный пункт только при 100% совпадении "
+    "с ячейкой из эталонного Google справочника. Если 100% совпадения нет, результат остается пустым."
 )
 
 try:
@@ -320,12 +286,12 @@ summary_df = build_summary(parsed_df, source_column, result_column, ref_column, 
 left, middle, right = st.columns(3)
 left.metric("Всего строк", len(parsed_df))
 middle.metric(
-    "Найдено НП",
-    int(summary_df.loc[summary_df["Показатель"] == "Найдено НП", "Значение"].iloc[0]),
+    "Найдено 100%",
+    int(summary_df.loc[summary_df["Показатель"] == "Найдено 100% совпадений", "Значение"].iloc[0]),
 )
 right.metric(
     "Не найдено",
-    int(summary_df.loc[summary_df["Показатель"] == "Не найдено НП", "Значение"].iloc[0]),
+    int(summary_df.loc[summary_df["Показатель"] == "Не найдено 100% совпадений", "Значение"].iloc[0]),
 )
 
 st.subheader("Сводка")
